@@ -276,7 +276,7 @@ def saveTiff(r,g,b,gt,filePath):
     fname_out   = filePath
     driver      = gdal.GetDriverByName('GTiff')
     # Create a 3-band dataset
-    dset_output = driver.Create(fname_out, r.shape[1], r.shape[0], 3, gdal.GDT_UInt16)
+    dset_output = driver.Create(fname_out, r.shape[1], r.shape[0], 3, gdal.GDT_Byte)
     dset_output.SetGeoTransform(gt)
     try:
         proj = osr.SpatialReference()
