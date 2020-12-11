@@ -44,3 +44,19 @@ style :
 source : Google China (default) or Google
 '''
 ```
+## 问题/Issues
+If you encounter the problem of Bad network link, you can change the HEADERS in the download function, and try again.
+```python
+def download(self,url):
+        HEADERS = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_7_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/29.0.1547.76 Safari/537.36'}
+        header = ur.Request(url,headers=HEADERS)
+        err=0
+        while(err<3):
+            try:
+                data = ur.urlopen(header).read()
+            except:
+                err+=1
+            else:
+                return data
+        raise Exception("Bad network link.")
+```
