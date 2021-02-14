@@ -11,12 +11,17 @@
 [downloader_1.2](https://github.com/zhengjie9510/Google-Map-Downloader/blob/master/downloader_1.2.py):  
     It is an improvement on version 1.1. Due to the existence of GIL locks in python's multi-threading, python's multi-threading cannot use multi-cores. Considering that computers are now multi-core, In order to make full use of the computer's multi-core resources and increase the download speed, try to use multi-process + multi-threaded way to achieve map tile download. The final speed has been greatly improved, but this part has not implemented the progress bar function.
 ## 指南/Guide
+### 安装/Install
+```python
+conda install --yes --file requirements.txt
+```
+### 使用/Use
 ```python
 if __name__ == '__main__':
     start_time=time.time()
     
-    # main(100.361,38.866,100.386,38.839,17,r'C:\Users\zheng\Desktop\test2.tif')
-    main(left,top,right,bottom,zoom,filePath,style='s',server="Google China")
+    # main(100.361,38.866,100.386,38.839,13,r'C:\Users\test.tif')
+    main(left,top,right,bottom,zoom,filePath,style='s',server="Google")
 
     end_time=time.time()
     print('lasted a total of {:.2f} seconds'.format(end_time-start_time))
