@@ -1,4 +1,4 @@
 GDAL==3.2.1
 numpy==1.20.1
-Pillow==8.2.0
+Pillow==8.3.2
 py-opencv==4.5.1
