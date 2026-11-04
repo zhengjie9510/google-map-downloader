@@ -1,67 +1,72 @@
-# Google-Map-Downloader
-![Google-Map-Downloader](https://geospatialmedia.s3.amazonaws.com/wp-content/uploads/2016/07/google-earth.jpg)
-## 中文：  
-[downloader_1.1](https://github.com/zhengjie9510/Google-Map-Downloader/blob/master/downloader_1.1.py)：  
-    一个小工具，你只需要输入空间范围、地图缩放等级就可以实现Google地图的下载，并输出为TIFF格式，含空间坐标系。  
-[downloader_1.2](https://github.com/zhengjie9510/Google-Map-Downloader/blob/master/downloader_1.2.py)：  
-    是在1.1版本上的改进。由于python的多线程中存在GIL锁，导致python的多线程不能利用多核，考虑到现在的计算机是多核的，为了充分利用计算机的多核资源，提高下载速度，尝试利用多进程+多线程的方式来实现地图切片下载，最终速度得到极大提高。但该部分还没有实现进度条功能。  
-## English:  
-[downloader_1.1](https://github.com/zhengjie9510/Google-Map-Downloader/blob/master/downloader_1.1.py):  
-    A small tool, you only need to input the spatial extent and map zoom level to download Google Maps, and output to TIFF format, including the spatial coordinate system.  
-[downloader_1.2](https://github.com/zhengjie9510/Google-Map-Downloader/blob/master/downloader_1.2.py):  
-    It is an improvement on version 1.1. Due to the existence of GIL locks in python's multi-threading, python's multi-threading cannot use multi-cores. Considering that computers are now multi-core, In order to make full use of the computer's multi-core resources and increase the download speed, try to use multi-process + multi-threaded way to achieve map tile download. The final speed has been greatly improved, but this part has not implemented the progress bar function.
-## 指南/Guide
-### 安装/Install
-```python
-conda install --yes --file requirements.txt
-```
-### 使用/Use
-```python
-if __name__ == '__main__':
-    start_time=time.time()
-    
-    # main(100.361,38.866,100.386,38.839,13,r'C:\Users\test.tif')
-    main(left,top,right,bottom,zoom,filePath,style='s',server="Google")
+# Google Map Downloader
 
-    end_time=time.time()
-    print('lasted a total of {:.2f} seconds'.format(end_time-start_time))
-```
-```python
-'''
-Parameters
-----------
-left, top : left-top coordinate, for example (100.361,38.866)
-    
-right, bottom : right-bottom coordinate
-    
-z : zoom
+[English](README_EN.md) | 简体中文
 
-filePath : File path for storing results, TIFF format
-    
-style : 
-    m for map; 
-    s for satellite; 
-    y for satellite with label; 
-    t for terrain; 
-    p for terrain with label; 
-    h for label;
+![Google Map Downloader](https://geospatialmedia.s3.amazonaws.com/wp-content/uploads/2016/07/google-earth.jpg)
 
-source : Google China (default) or Google
-'''
+根据经纬度范围和缩放等级下载 Google 地图瓦片，并合成为带有 WGS 84 坐标信息的 GeoTIFF 文件。
+
+## 功能
+
+- 支持卫星图、道路图、地形图和标注图层
+- 支持 Google 与 Google China 地图服务
+- 自动拼接瓦片并写入地理坐标信息
+- 使用多进程和多线程提高下载速度
+
+## 快速开始
+
+安装 [uv](https://docs.astral.sh/uv/) 后，在项目目录运行：
+
+```shell
+uv sync
+uv run python downloader_1.2.py
 ```
-## 问题/Issues
-If you encounter the problem of Bad network link, you can change the HEADERS in the download function, and try again.
-```python
-def download(self,url):
-        HEADERS = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_7_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/29.0.1547.76 Safari/537.36'}
-        header = ur.Request(url,headers=HEADERS)
-        err=0
-        while(err<3):
-            try:
-                data = ur.urlopen(header).read()
-            except:
-                err+=1
-            else:
-                return data
-        raise Exception("Bad network link.")
+
+脚本会下载一个小范围示例，并在项目目录生成 `example.tif`。
+
+## 命令行参数
+
+通过命令行指定下载范围、缩放等级和输出文件：
+
+```shell
+uv run python downloader_1.2.py --left 100.361 --top 38.866 --right 100.386 --bottom 38.839 --zoom 13 --output example.tif --style s --server Google
 ```
+
+参数说明：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--left`, `--top` | 下载区域左上角的经纬度 |
+| `--right`, `--bottom` | 下载区域右下角的经纬度 |
+| `--zoom` | 地图缩放等级，等级越高分辨率越高、瓦片越多 |
+| `--output` | 输出 GeoTIFF 文件路径 |
+| `--style` | 地图样式，见下表 |
+| `--server` | 地图服务：`Google` 或 `Google China` |
+
+所有参数都有示例默认值。查看完整帮助：
+
+```shell
+uv run python downloader_1.2.py --help
+```
+
+地图样式：
+
+| 值 | 样式 |
+| --- | --- |
+| `m` | 道路图 |
+| `s` | 卫星图 |
+| `y` | 带标注的卫星图 |
+| `t` | 地形图 |
+| `p` | 带标注的地形图 |
+| `h` | 标注图层 |
+
+## 脚本版本
+
+- `downloader_1.2.py`：推荐使用，多进程与多线程下载。
+- `downloader_1.1.py`：早期版本，使用多线程下载并显示进度。
+
+## 常见问题
+
+如果出现 `Bad network link`，通常是当前网络无法访问地图瓦片服务。请先检查网络连接，也可以尝试切换 `server`。
+
+下载和使用地图数据时，请遵守相应地图服务的使用条款以及当地法律法规。

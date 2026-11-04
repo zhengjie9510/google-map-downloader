@@ -7,6 +7,7 @@ This code is used to download image from google
 @E-mail: zhengjie9510@qq.com
 '''
 
+import argparse
 import io
 import math
 import numpy as np
@@ -16,7 +17,8 @@ import urllib.request as ur
 import PIL.Image as pil
 
 import cv2
-from osgeo import gdal, osr
+import rasterio
+from rasterio.transform import Affine
 import time
 
 
@@ -187,37 +189,39 @@ class Downloader(Thread):
         self.index = index
         self.count = count
         self.update = update
+        self.error = None
 
     def download(self, url):
         HEADERS = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.150 Safari/537.36 Edg/88.0.705.68'}
         header = ur.Request(url, headers=HEADERS)
-        err = 0
-        while (err < 3):
+        last_error = None
+        for _ in range(3):
             try:
-                data = ur.urlopen(header).read()
-            except:
-                err += 1
-            else:
-                return data
-        raise Exception("Bad network link.")
+                return ur.urlopen(header).read()
+            except Exception as error:
+                last_error = error
+        raise RuntimeError(f"Failed to download tile after 3 attempts: {url}") from last_error
 
     def run(self):
-        for i, url in enumerate(self.urls):
-            if i % self.count != self.index:
-                continue
-            self.datas[i] = self.download(url)
-            if mutex.acquire():
-                self.update()
-                mutex.release()
+        try:
+            for i, url in enumerate(self.urls):
+                if i % self.count != self.index:
+                    continue
+                self.datas[i] = self.download(url)
+                if mutex.acquire():
+                    self.update()
+                    mutex.release()
+        except Exception as error:
+            self.error = error
 
 
 # ---------------------------------------------------------
 
 # ---------------------------------------------------------
 MAP_URLS = {
-    "Google": "http://mts0.googleapis.com/vt?lyrs={style}&x={x}&y={y}&z={z}",
-    "Google China": "http://mt2.google.cn/vt/lyrs={style}&hl=zh-CN&gl=CN&src=app&x={x}&y={y}&z={z}"}
+    "Google": "https://mts0.googleapis.com/vt?lyrs={style}&x={x}&y={y}&z={z}",
+    "Google China": "https://mt2.google.cn/vt/lyrs={style}&hl=zh-CN&gl=CN&src=app&x={x}&y={y}&z={z}"}
 
 
 def get_url(source, x, y, z, style):  #
@@ -261,6 +265,9 @@ def download_tiles(urls, multi=10):
         i.start()
     for i in tasks:
         i.join()
+    for task in tasks:
+        if task.error is not None:
+            raise task.error
     return datas
 
 
@@ -301,22 +308,19 @@ def getExtent(x1, y1, x2, y2, z, source="Google China"):
 
 
 def saveTiff(r, g, b, gt, filePath):
-    fname_out = filePath
-    driver = gdal.GetDriverByName('GTiff')
-    # Create a 3-band dataset
-    dset_output = driver.Create(fname_out, r.shape[1], r.shape[0], 3, gdal.GDT_Byte)
-    dset_output.SetGeoTransform(gt)
-    try:
-        proj = osr.SpatialReference()
-        proj.ImportFromEPSG(4326)
-        dset_output.SetSpatialRef(proj)
-    except:
-        print("Error: Coordinate system setting failed")
-    dset_output.GetRasterBand(1).WriteArray(r)
-    dset_output.GetRasterBand(2).WriteArray(g)
-    dset_output.GetRasterBand(3).WriteArray(b)
-    dset_output.FlushCache()
-    dset_output = None
+    with rasterio.open(
+            filePath,
+            'w',
+            driver='GTiff',
+            width=r.shape[1],
+            height=r.shape[0],
+            count=3,
+            dtype=r.dtype,
+            crs='EPSG:4326',
+            transform=Affine.from_gdal(*gt)) as output:
+        output.write(r, 1)
+        output.write(g, 2)
+        output.write(b, 3)
     print("Image Saved")
 
 
@@ -349,6 +353,8 @@ def main(left, top, right, bottom, zoom, filePath, style='s', server="Google Chi
     
     source : Google China (default) or Google
     """
+    validate_extent(left, top, right, bottom, zoom)
+
     # ---------------------------------------------------------
     # Get the urls of all tiles in the extent
     urls = get_urls(left, top, right, bottom, zoom, server, style)
@@ -368,13 +374,40 @@ def main(left, top, right, bottom, zoom, filePath, style='s', server="Google Chi
     saveTiff(r, g, b, gt, filePath)
 
 
-# ---------------------------------------------------------
+def validate_extent(left, top, right, bottom, zoom):
+    if not -180 <= left < right <= 180:
+        raise ValueError('Longitude must satisfy -180 <= left < right <= 180.')
+    if not -85.0511287798 <= bottom < top <= 85.0511287798:
+        raise ValueError('Latitude must satisfy -85.0511287798 <= bottom < top <= 85.0511287798.')
+    if not 0 <= zoom <= 22:
+        raise ValueError('Zoom must be between 0 and 22.')
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Download Google Maps tiles as a GeoTIFF.')
+    parser.add_argument('--left', type=float, default=100.361, help='Left longitude.')
+    parser.add_argument('--top', type=float, default=38.866, help='Top latitude.')
+    parser.add_argument('--right', type=float, default=100.386, help='Right longitude.')
+    parser.add_argument('--bottom', type=float, default=38.839, help='Bottom latitude.')
+    parser.add_argument('--zoom', type=int, default=13, help='Map zoom level.')
+    parser.add_argument('--output', default='example.tif', help='Output GeoTIFF path.')
+    parser.add_argument('--style', choices=['m', 's', 'y', 't', 'p', 'h'], default='s', help='Map style.')
+    parser.add_argument('--server', choices=['Google', 'Google China'], default='Google', help='Map server.')
+    args = parser.parse_args()
+    try:
+        validate_extent(args.left, args.top, args.right, args.bottom, args.zoom)
+    except ValueError as error:
+        parser.error(str(error))
+    return args
+
+
 if __name__ == '__main__':
+    args = parse_args()
     start_time = time.time()
 
     COUNT = 0  # Progress display, starting at 0
     mutex = Lock()
-    main(100.361, 38.866, 100.386, 38.839, 13, r'D:\Documents\Temp\test1.tif', server="Google")
+    main(args.left, args.top, args.right, args.bottom, args.zoom, args.output, args.style, args.server)
 
     end_time = time.time()
     print('lasted a total of {:.2f} seconds'.format(end_time - start_time))
