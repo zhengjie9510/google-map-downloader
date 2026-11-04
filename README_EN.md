@@ -4,14 +4,14 @@ English | [简体中文](README.md)
 
 ![Google Map Downloader](https://geospatialmedia.s3.amazonaws.com/wp-content/uploads/2016/07/google-earth.jpg)
 
-Download Google Maps tiles for a specified geographic extent and zoom level, then merge them into a GeoTIFF with WGS 84 coordinates.
+Supports Google and Tianditu. Download map tiles for a specified geographic extent and zoom level, then merge them into a GeoTIFF with WGS 84 coordinates.
 
 ## Features
 
 - Satellite, road, terrain, and label layers
-- Google and Google China map services
+- Google and Tianditu map services
 - Automatic tile merging and geographic metadata
-- Multiprocessing and multithreading for faster downloads
+- Concurrent tile downloads
 
 ## Quick Start
 
@@ -23,6 +23,8 @@ uv run python downloader_1.2.py
 ```
 
 The script downloads a small example area and creates `example.tif` in the project directory.
+
+Before using Google, open the [Google map service test](https://mts0.googleapis.com/vt?lyrs=s&x=1&y=1&z=1). If the browser displays a map tile, the service is reachable from your network. Otherwise, use Tianditu instead.
 
 ## Command-line Options
 
@@ -41,7 +43,8 @@ Parameters:
 | `--zoom` | Map zoom level; higher levels provide more detail and require more tiles |
 | `--output` | Output GeoTIFF path |
 | `--style` | Map style; see the table below |
-| `--server` | Map service: `Google` or `Google China` |
+| `--server` | Map service: `Google` or `Tianditu` |
+| `--token` | Tianditu API token; required only when using Tianditu |
 
 All options have example defaults. To see the complete help text:
 
@@ -60,10 +63,20 @@ Map styles:
 | `p` | Terrain with labels |
 | `h` | Labels |
 
+## Using Tianditu
+
+Request a token from the [Tianditu console](https://console.tianditu.gov.cn/), then pass it with `--token`:
+
+```shell
+uv run python downloader_1.2.py --server Tianditu --token YOUR_TOKEN --style y --zoom 13 --output tianditu.tif
+```
+
+Tianditu supports zoom levels up to 18. Styles with labels automatically combine the base map with the matching Chinese annotation layer.
+
 ## Script Versions
 
-- `downloader_1.2.py`: Recommended. Uses multiprocessing and multithreading.
-- `downloader_1.1.py`: Earlier version. Uses multithreading and displays progress.
+- `downloader_1.2.py`: Recommended. Uses a simpler implementation with concurrent downloads.
+- `downloader_1.1.py`: Uses manually managed threads with progress output and retains WGS 84, Web Mercator, and GCJ-02 conversion utilities.
 
 ## Troubleshooting
 

@@ -1,413 +1,303 @@
-# -*- coding: utf-8 -*-
-'''
-This code is used to download image from google
-
-@date  : 2020-3-10
-@author: Zheng Jie
-@E-mail: zhengjie9510@qq.com
-'''
+"""Download map tiles with visible progress and save them as a GeoTIFF."""
 
 import argparse
 import io
 import math
-import numpy as np
-from math import floor, pi, log, tan, atan, exp
-from threading import Thread, Lock
-import urllib.request as ur
-import PIL.Image as pil
-
-import cv2
-import rasterio
-from rasterio.transform import Affine
+import os
 import time
+import urllib.parse
+import urllib.request
+from queue import Empty, Queue
+from threading import Lock, Thread
+
+import numpy as np
+import rasterio
+from PIL import Image
+from rasterio.transform import from_bounds
 
 
-# ------------------Interchange between WGS-84 and Web Mercator-------------------------
-# WGS-84 to Web Mercator
-def wgs_to_mercator(x, y):
-    y = 85.0511287798 if y > 85.0511287798 else y
-    y = -85.0511287798 if y < -85.0511287798 else y
+MAX_LATITUDE = 85.0511287798
+TILE_SIZE = 256
+DOWNLOAD_RETRIES = 3
+DOWNLOAD_TIMEOUT = 20
+DEFAULT_WORKERS = 10
 
-    x2 = x * 20037508.34 / 180
-    y2 = log(tan((90 + y) * pi / 360)) / (pi / 180)
-    y2 = y2 * 20037508.34 / 180
-    return x2, y2
-
-
-# Web Mercator to WGS-84
-def mercator_to_wgs(x, y):
-    x2 = x / 20037508.34 * 180
-    y2 = y / 20037508.34 * 180
-    y2 = 180 / pi * (2 * atan(exp(y2 * pi / 180)) - pi / 2)
-    return x2, y2
-
-
-# -------------------------------------------------------------
-
-# -----------------Interchange between GCJ-02 to WGS-84---------------------------
-# All public geographic data in mainland China need to be encrypted with GCJ-02, introducing random bias
-# This part of the code is used to remove the bias
-def transformLat(x, y):
-    ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * math.sqrt(abs(x))
-    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
-    ret += (20.0 * math.sin(y * math.pi) + 40.0 * math.sin(y / 3.0 * math.pi)) * 2.0 / 3.0
-    ret += (160.0 * math.sin(y / 12.0 * math.pi) + 320 * math.sin(y * math.pi / 30.0)) * 2.0 / 3.0
-    return ret
+GOOGLE_URL = "https://mts0.googleapis.com/vt?lyrs={style}&x={x}&y={y}&z={z}"
+TIANDITU_LAYERS = {
+    "m": ("vec", "cva"),
+    "s": ("img",),
+    "y": ("img", "cia"),
+    "t": ("ter",),
+    "p": ("ter", "cta"),
+    "h": ("cva",),
+}
+STYLE_NAMES = {
+    "m": "map",
+    "s": "satellite",
+    "y": "satellite with labels",
+    "t": "terrain",
+    "p": "terrain with labels",
+    "h": "labels",
+}
+REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://www.tianditu.gov.cn/",
+}
 
 
-def transformLon(x, y):
-    ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * math.sqrt(abs(x))
-    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
-    ret += (20.0 * math.sin(x * math.pi) + 40.0 * math.sin(x / 3.0 * math.pi)) * 2.0 / 3.0
-    ret += (150.0 * math.sin(x / 12.0 * math.pi) + 300.0 * math.sin(x / 30.0 * math.pi)) * 2.0 / 3.0
-    return ret
+# Coordinate conversion utilities retained for callers that need them.
 
-
-def delta(lat, lon):
-    ''' 
-    Krasovsky 1940
-    //
-    // a = 6378245.0, 1/f = 298.3
-    // b = a * (1 - f)
-    // ee = (a^2 - b^2) / a^2;
-    '''
-    a = 6378245.0  # a: Projection factor of satellite ellipsoidal coordinates projected onto a flat map coordinate system
-    ee = 0.00669342162296594323  # ee: Eccentricity of ellipsoid
-    dLat = transformLat(lon - 105.0, lat - 35.0)
-    dLon = transformLon(lon - 105.0, lat - 35.0)
-    radLat = lat / 180.0 * math.pi
-    magic = math.sin(radLat)
-    magic = 1 - ee * magic * magic
-    sqrtMagic = math.sqrt(magic)
-    dLat = (dLat * 180.0) / ((a * (1 - ee)) / (magic * sqrtMagic) * math.pi)
-    dLon = (dLon * 180.0) / (a / sqrtMagic * math.cos(radLat) * math.pi)
-    return {'lat': dLat, 'lon': dLon}
-
-
-def outOfChina(lat, lon):
-    if (lon < 72.004 or lon > 137.8347):
-        return True
-    if (lat < 0.8293 or lat > 55.8271):
-        return True
-    return False
-
-
-def gcj_to_wgs(gcjLon, gcjLat):
-    if outOfChina(gcjLat, gcjLon):
-        return (gcjLon, gcjLat)
-    d = delta(gcjLat, gcjLon)
-    return (gcjLon - d["lon"], gcjLat - d["lat"])
-
-
-def wgs_to_gcj(wgsLon, wgsLat):
-    if outOfChina(wgsLat, wgsLon):
-        return wgsLon, wgsLat
-    d = delta(wgsLat, wgsLon);
-    return wgsLon + d["lon"], wgsLat + d["lat"]
-
-
-# --------------------------------------------------------------
-
-# ---------------------------------------------------------
-# Get tile coordinates in Google Maps based on latitude and longitude of WGS-84
-def wgs_to_tile(j, w, z):
-    '''
-    Get google-style tile cooridinate from geographical coordinate
-    j : Longittude
-    w : Latitude
-    z : zoom
-    '''
-    isnum = lambda x: isinstance(x, int) or isinstance(x, float)
-    if not (isnum(j) and isnum(w)):
-        raise TypeError("j and w must be int or float!")
-
-    if not isinstance(z, int) or z < 0 or z > 22:
-        raise TypeError("z must be int and between 0 to 22.")
-
-    if j < 0:
-        j = 180 + j
-    else:
-        j += 180
-    j /= 360  # make j to (0,1)
-
-    w = 85.0511287798 if w > 85.0511287798 else w
-    w = -85.0511287798 if w < -85.0511287798 else w
-    w = log(tan((90 + w) * pi / 360)) / (pi / 180)
-    w /= 180  # make w to (-1,1)
-    w = 1 - (w + 1) / 2  # make w to (0,1) and left top is 0-point
-
-    num = 2 ** z
-    x = floor(j * num)
-    y = floor(w * num)
+def wgs84_to_web_mercator(longitude, latitude):
+    """Convert a WGS 84 coordinate to Web Mercator metres."""
+    latitude = max(-MAX_LATITUDE, min(MAX_LATITUDE, latitude))
+    x = longitude * 20037508.34 / 180
+    y = math.log(math.tan(math.radians(45 + latitude / 2))) * 20037508.34 / math.pi
     return x, y
 
 
-def pixls_to_mercator(zb):
-    # Get the web Mercator projection coordinates of the four corners of the area according to the four corner coordinates of the tile
-    inx, iny = zb["LT"]  # left top
-    inx2, iny2 = zb["RB"]  # right bottom
-    length = 20037508.3427892
-    sum = 2 ** zb["z"]
-    LTx = inx / sum * length * 2 - length
-    LTy = -(iny / sum * length * 2) + length
-
-    RBx = (inx2 + 1) / sum * length * 2 - length
-    RBy = -((iny2 + 1) / sum * length * 2) + length
-
-    # LT=left top,RB=right buttom
-    # Returns the projected coordinates of the four corners
-    res = {'LT': (LTx, LTy), 'RB': (RBx, RBy),
-           'LB': (LTx, RBy), 'RT': (RBx, LTy)}
-    return res
+def web_mercator_to_wgs84(x, y):
+    """Convert Web Mercator metres to a WGS 84 coordinate."""
+    longitude = x / 20037508.34 * 180
+    latitude = math.degrees(2 * math.atan(math.exp(y / 20037508.34 * math.pi)) - math.pi / 2)
+    return longitude, latitude
 
 
-def tile_to_pixls(zb):
-    # Tile coordinates are converted to pixel coordinates of the four corners
-    out = {}
-    width = (zb["RT"][0] - zb["LT"][0] + 1) * 256
-    height = (zb["LB"][1] - zb["LT"][1] + 1) * 256
-    out["LT"] = (0, 0)
-    out["RT"] = (width, 0)
-    out["LB"] = (0, -height)
-    out["RB"] = (width, -height)
-    return out
+def _transform_latitude(x, y):
+    result = -100 + 2 * x + 3 * y + 0.2 * y ** 2 + 0.1 * x * y + 0.2 * math.sqrt(abs(x))
+    result += (20 * math.sin(6 * x * math.pi) + 20 * math.sin(2 * x * math.pi)) * 2 / 3
+    result += (20 * math.sin(y * math.pi) + 40 * math.sin(y / 3 * math.pi)) * 2 / 3
+    result += (160 * math.sin(y / 12 * math.pi) + 320 * math.sin(y / 30 * math.pi)) * 2 / 3
+    return result
 
 
-# -----------------------------------------------------------
+def _transform_longitude(x, y):
+    result = 300 + x + 2 * y + 0.1 * x ** 2 + 0.1 * x * y + 0.1 * math.sqrt(abs(x))
+    result += (20 * math.sin(6 * x * math.pi) + 20 * math.sin(2 * x * math.pi)) * 2 / 3
+    result += (20 * math.sin(x * math.pi) + 40 * math.sin(x / 3 * math.pi)) * 2 / 3
+    result += (150 * math.sin(x / 12 * math.pi) + 300 * math.sin(x / 30 * math.pi)) * 2 / 3
+    return result
 
-# ---------------------------------------------------------
-class Downloader(Thread):
-    # multiple threads downloader
-    def __init__(self, index, count, urls, datas, update):
-        # index represents the number of threads
-        # count represents the total number of threads
-        # urls represents the list of URLs nedd to be downloaded
-        # datas represents the list of data need to be returned.
-        super().__init__()
-        self.urls = urls
-        self.datas = datas
-        self.index = index
-        self.count = count
-        self.update = update
-        self.error = None
 
-    def download(self, url):
-        HEADERS = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.150 Safari/537.36 Edg/88.0.705.68'}
-        header = ur.Request(url, headers=HEADERS)
-        last_error = None
-        for _ in range(3):
-            try:
-                return ur.urlopen(header).read()
-            except Exception as error:
-                last_error = error
-        raise RuntimeError(f"Failed to download tile after 3 attempts: {url}") from last_error
+def _outside_china(longitude, latitude):
+    return not (72.004 <= longitude <= 137.8347 and 0.8293 <= latitude <= 55.8271)
 
-    def run(self):
+
+def _gcj02_offset(longitude, latitude):
+    semi_major_axis = 6378245.0
+    eccentricity_squared = 0.00669342162296594323
+    latitude_offset = _transform_latitude(longitude - 105, latitude - 35)
+    longitude_offset = _transform_longitude(longitude - 105, latitude - 35)
+    latitude_radians = math.radians(latitude)
+    magic = 1 - eccentricity_squared * math.sin(latitude_radians) ** 2
+    sqrt_magic = math.sqrt(magic)
+    latitude_offset *= 180 / ((semi_major_axis * (1 - eccentricity_squared)) / (magic * sqrt_magic) * math.pi)
+    longitude_offset *= 180 / (semi_major_axis / sqrt_magic * math.cos(latitude_radians) * math.pi)
+    return longitude_offset, latitude_offset
+
+
+def wgs84_to_gcj02(longitude, latitude):
+    """Convert WGS 84 to GCJ-02 within mainland China."""
+    if _outside_china(longitude, latitude):
+        return longitude, latitude
+    longitude_offset, latitude_offset = _gcj02_offset(longitude, latitude)
+    return longitude + longitude_offset, latitude + latitude_offset
+
+
+def gcj02_to_wgs84(longitude, latitude):
+    """Approximately convert GCJ-02 to WGS 84 within mainland China."""
+    if _outside_china(longitude, latitude):
+        return longitude, latitude
+    longitude_offset, latitude_offset = _gcj02_offset(longitude, latitude)
+    return longitude - longitude_offset, latitude - latitude_offset
+
+
+def coordinates_to_tile(longitude, latitude, zoom):
+    """Return the XYZ tile containing a WGS 84 coordinate."""
+    latitude = max(-MAX_LATITUDE, min(MAX_LATITUDE, latitude))
+    tile_count = 2 ** zoom
+    x = math.floor((longitude + 180) / 360 * tile_count)
+    latitude_radians = math.radians(latitude)
+    y = math.floor((1 - math.asinh(math.tan(latitude_radians)) / math.pi) / 2 * tile_count)
+    return x, y
+
+
+def tile_to_coordinates(x, y, zoom):
+    """Return the WGS 84 coordinate at the top-left corner of an XYZ tile."""
+    tile_count = 2 ** zoom
+    longitude = x / tile_count * 360 - 180
+    latitude = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / tile_count))))
+    return longitude, latitude
+
+
+def get_tile_grid(left, top, right, bottom, zoom):
+    first_x, first_y = coordinates_to_tile(left, top, zoom)
+    last_x, last_y = coordinates_to_tile(right, bottom, zoom)
+    return first_x, first_y, last_x, last_y
+
+
+def build_google_urls(style, x, y, zoom):
+    return (GOOGLE_URL.format(style=style, x=x, y=y, z=zoom),)
+
+
+def build_tianditu_urls(style, x, y, zoom, token):
+    urls = []
+    for layer in TIANDITU_LAYERS[style]:
+        params = urllib.parse.urlencode({
+            "SERVICE": "WMTS",
+            "REQUEST": "GetTile",
+            "VERSION": "1.0.0",
+            "LAYER": layer,
+            "STYLE": "default",
+            "TILEMATRIXSET": "w",
+            "FORMAT": "tiles",
+            "TILEMATRIX": zoom,
+            "TILEROW": y,
+            "TILECOL": x,
+            "tk": token,
+        })
+        node = (x + y) % 8
+        urls.append(f"https://t{node}.tianditu.gov.cn/{layer}_w/wmts?{params}")
+    return tuple(urls)
+
+
+def build_tile_urls(server, style, x, y, zoom, token=None):
+    if server == "Google":
+        return build_google_urls(style, x, y, zoom)
+    return build_tianditu_urls(style, x, y, zoom, token)
+
+
+def fetch_url(url):
+    request = urllib.request.Request(url, headers=REQUEST_HEADERS)
+    last_error = None
+    for _ in range(DOWNLOAD_RETRIES):
         try:
-            for i, url in enumerate(self.urls):
-                if i % self.count != self.index:
-                    continue
-                self.datas[i] = self.download(url)
-                if mutex.acquire():
-                    self.update()
-                    mutex.release()
+            with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response:
+                return response.read()
         except Exception as error:
-            self.error = error
+            last_error = error
+    host = urllib.parse.urlsplit(url).netloc
+    raise RuntimeError(f"Failed to download tile from {host} after {DOWNLOAD_RETRIES} attempts.") from last_error
 
 
-# ---------------------------------------------------------
-
-# ---------------------------------------------------------
-MAP_URLS = {
-    "Google": "https://mts0.googleapis.com/vt?lyrs={style}&x={x}&y={y}&z={z}",
-    "Google China": "https://mt2.google.cn/vt/lyrs={style}&hl=zh-CN&gl=CN&src=app&x={x}&y={y}&z={z}"}
-
-
-def get_url(source, x, y, z, style):  #
-    if source == 'Google China':
-        url = MAP_URLS["Google China"].format(x=x, y=y, z=z, style=style)
-    elif source == 'Google':
-        url = MAP_URLS["Google"].format(x=x, y=y, z=z, style=style)
-    else:
-        raise Exception("Unknown Map Source ! ")
-    return url
+def download_tile(urls):
+    layers = [Image.open(io.BytesIO(fetch_url(url))).convert("RGBA") for url in urls]
+    tile = layers[0]
+    for layer in layers[1:]:
+        tile = Image.alpha_composite(tile, layer)
+    return tile
 
 
-def get_urls(x1, y1, x2, y2, z, source='google', style='s'):
-    pos1x, pos1y = wgs_to_tile(x1, y1, z)
-    pos2x, pos2y = wgs_to_tile(x2, y2, z)
-    lenx = pos2x - pos1x + 1
-    leny = pos2y - pos1y + 1
-    print("Total tiles number：{x} X {y}".format(x=lenx, y=leny))
-    urls = [get_url(source, i, j, z, style) for j in range(pos1y, pos1y + leny) for i in range(pos1x, pos1x + lenx)]
-    return urls
+def download_tiles(tile_urls, worker_count=DEFAULT_WORKERS):
+    """Download tiles with manually managed threads and display progress."""
+    tasks = Queue()
+    results = [None] * len(tile_urls)
+    errors = []
+    progress_lock = Lock()
+    completed = 0
+
+    for index, urls in enumerate(tile_urls):
+        tasks.put((index, urls))
+
+    def worker():
+        nonlocal completed
+        while True:
+            try:
+                index, urls = tasks.get_nowait()
+            except Empty:
+                return
+            try:
+                results[index] = download_tile(urls)
+                with progress_lock:
+                    completed += 1
+                    print(f"\rDownloading... {completed}/{len(tile_urls)}", end="", flush=True)
+            except Exception as error:
+                with progress_lock:
+                    errors.append(error)
+                return
+
+    threads = [Thread(target=worker) for _ in range(min(worker_count, len(tile_urls)))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    print()
+
+    if errors:
+        raise errors[0]
+    return results
 
 
-# ---------------------------------------------------------
-
-# ---------------------------------------------------------
-def download_tiles(urls, multi=10):
-    def makeupdate(s):
-        def up():
-            global COUNT
-            COUNT += 1
-            print("\rDownLoading...[{0}/{1}]".format(COUNT, s), end='')
-
-        return up
-
-    url_len = len(urls)
-    datas = [None] * url_len
-    if multi < 1 or multi > 20 or not isinstance(multi, int):
-        raise Exception("multi of Downloader shuold be int and between 1 to 20.")
-    tasks = [Downloader(i, multi, urls, datas, makeupdate(url_len)) for i in range(multi)]
-    for i in tasks:
-        i.start()
-    for i in tasks:
-        i.join()
-    for task in tasks:
-        if task.error is not None:
-            raise task.error
-    return datas
+def merge_tiles(tiles, columns, rows):
+    image = Image.new("RGB", (columns * TILE_SIZE, rows * TILE_SIZE))
+    for index, tile in enumerate(tiles):
+        x = index % columns
+        y = index // columns
+        image.paste(tile.convert("RGB"), (x * TILE_SIZE, y * TILE_SIZE))
+    return image
 
 
-def merge_tiles(datas, x1, y1, x2, y2, z):
-    pos1x, pos1y = wgs_to_tile(x1, y1, z)
-    pos2x, pos2y = wgs_to_tile(x2, y2, z)
-    lenx = pos2x - pos1x + 1
-    leny = pos2y - pos1y + 1
-    outpic = pil.new('RGBA', (lenx * 256, leny * 256))
-    for i, data in enumerate(datas):
-        picio = io.BytesIO(data)
-        small_pic = pil.open(picio)
+def save_geotiff(image, output_path, tile_grid, zoom):
+    first_x, first_y, last_x, last_y = tile_grid
+    west, north = tile_to_coordinates(first_x, first_y, zoom)
+    east, south = tile_to_coordinates(last_x + 1, last_y + 1, zoom)
+    transform = from_bounds(west, south, east, north, image.width, image.height)
+    bands = np.asarray(image).transpose(2, 0, 1)
 
-        y, x = i // lenx, i % lenx
-        outpic.paste(small_pic, (x * 256, y * 256))
-    print('\nTiles merge completed')
-    return outpic
+    with rasterio.open(output_path, "w", driver="GTiff", width=image.width, height=image.height,
+                       count=3, dtype=bands.dtype, crs="EPSG:4326", transform=transform) as output:
+        output.write(bands)
 
 
-# ---------------------------------------------------------
-
-# ---------------------------------------------------------
-def getExtent(x1, y1, x2, y2, z, source="Google China"):
-    pos1x, pos1y = wgs_to_tile(x1, y1, z)
-    pos2x, pos2y = wgs_to_tile(x2, y2, z)
-    Xframe = pixls_to_mercator(
-        {"LT": (pos1x, pos1y), "RT": (pos2x, pos1y), "LB": (pos1x, pos2y), "RB": (pos2x, pos2y), "z": z})
-    for i in ["LT", "LB", "RT", "RB"]:
-        Xframe[i] = mercator_to_wgs(*Xframe[i])
-    if source == "Google":
-        pass
-    elif source == "Google China":
-        for i in ["LT", "LB", "RT", "RB"]:
-            Xframe[i] = gcj_to_wgs(*Xframe[i])
-    else:
-        raise Exception("Invalid argument: source.")
-    return Xframe
-
-
-def saveTiff(r, g, b, gt, filePath):
-    with rasterio.open(
-            filePath,
-            'w',
-            driver='GTiff',
-            width=r.shape[1],
-            height=r.shape[0],
-            count=3,
-            dtype=r.dtype,
-            crs='EPSG:4326',
-            transform=Affine.from_gdal(*gt)) as output:
-        output.write(r, 1)
-        output.write(g, 2)
-        output.write(b, 3)
-    print("Image Saved")
-
-
-# ---------------------------------------------------------
-
-def main(left, top, right, bottom, zoom, filePath, style='s', server="Google China"):
-    """
-    Download images based on spatial extent.
-
-    East longitude is positive and west longitude is negative.
-    North latitude is positive, south latitude is negative.
-
-    Parameters
-    ----------
-    left, top : left-top coordinate, for example (100.361,38.866)
-        
-    right, bottom : right-bottom coordinate
-        
-    z : zoom
-
-    filePath : File path for storing results, TIFF format
-        
-    style : 
-        m for map; 
-        s for satellite; 
-        y for satellite with label; 
-        t for terrain; 
-        p for terrain with label; 
-        h for label;
-    
-    source : Google China (default) or Google
-    """
-    validate_extent(left, top, right, bottom, zoom)
-
-    # ---------------------------------------------------------
-    # Get the urls of all tiles in the extent
-    urls = get_urls(left, top, right, bottom, zoom, server, style)
-
-    # Download tiles
-    datas = download_tiles(urls)
-
-    # Combine downloaded tile maps into one map
-    outpic = merge_tiles(datas, left, top, right, bottom, zoom)
-    outpic = outpic.convert('RGB')
-    r, g, b = cv2.split(np.array(outpic))
-
-    # Get the spatial information of the four corners of the merged map and use it for outputting
-    extent = getExtent(left, top, right, bottom, zoom, server)
-    gt = (extent['LT'][0], (extent['RB'][0] - extent['LT'][0]) / r.shape[1], 0, extent['LT'][1], 0,
-          (extent['RB'][1] - extent['LT'][1]) / r.shape[0])
-    saveTiff(r, g, b, gt, filePath)
-
-
-def validate_extent(left, top, right, bottom, zoom):
+def validate_options(left, top, right, bottom, zoom, server, token):
     if not -180 <= left < right <= 180:
-        raise ValueError('Longitude must satisfy -180 <= left < right <= 180.')
-    if not -85.0511287798 <= bottom < top <= 85.0511287798:
-        raise ValueError('Latitude must satisfy -85.0511287798 <= bottom < top <= 85.0511287798.')
+        raise ValueError("Longitude must satisfy -180 <= left < right <= 180.")
+    if not -MAX_LATITUDE <= bottom < top <= MAX_LATITUDE:
+        raise ValueError(f"Latitude must satisfy {-MAX_LATITUDE} <= bottom < top <= {MAX_LATITUDE}.")
     if not 0 <= zoom <= 22:
-        raise ValueError('Zoom must be between 0 and 22.')
+        raise ValueError("Zoom must be between 0 and 22.")
+    if server == "Tianditu" and not token:
+        raise ValueError("Tianditu requires --token or the TIANDITU_TOKEN environment variable.")
+    if server == "Tianditu" and zoom > 18:
+        raise ValueError("Tianditu supports zoom levels from 0 to 18.")
+
+
+def main(left, top, right, bottom, zoom, output_path, style="s", server="Google", token=None):
+    validate_options(left, top, right, bottom, zoom, server, token)
+    tile_grid = get_tile_grid(left, top, right, bottom, zoom)
+    first_x, first_y, last_x, last_y = tile_grid
+    columns = last_x - first_x + 1
+    rows = last_y - first_y + 1
+    tile_urls = [build_tile_urls(server, style, x, y, zoom, token)
+                 for y in range(first_y, last_y + 1) for x in range(first_x, last_x + 1)]
+
+    print(f"Area covers {columns} x {rows} tiles")
+    tiles = download_tiles(tile_urls)
+    image = merge_tiles(tiles, columns, rows)
+    save_geotiff(image, output_path, tile_grid, zoom)
+    print(f"Saved {output_path}")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Download Google Maps tiles as a GeoTIFF.')
-    parser.add_argument('--left', type=float, default=100.361, help='Left longitude.')
-    parser.add_argument('--top', type=float, default=38.866, help='Top latitude.')
-    parser.add_argument('--right', type=float, default=100.386, help='Right longitude.')
-    parser.add_argument('--bottom', type=float, default=38.839, help='Bottom latitude.')
-    parser.add_argument('--zoom', type=int, default=13, help='Map zoom level.')
-    parser.add_argument('--output', default='example.tif', help='Output GeoTIFF path.')
-    parser.add_argument('--style', choices=['m', 's', 'y', 't', 'p', 'h'], default='s', help='Map style.')
-    parser.add_argument('--server', choices=['Google', 'Google China'], default='Google', help='Map server.')
+    parser = argparse.ArgumentParser(description="Download map tiles as a GeoTIFF.")
+    parser.add_argument("--left", type=float, default=100.361, help="Left longitude.")
+    parser.add_argument("--top", type=float, default=38.866, help="Top latitude.")
+    parser.add_argument("--right", type=float, default=100.386, help="Right longitude.")
+    parser.add_argument("--bottom", type=float, default=38.839, help="Bottom latitude.")
+    parser.add_argument("--zoom", type=int, default=13, help="Map zoom level.")
+    parser.add_argument("--output", default="example.tif", help="Output GeoTIFF path.")
+    parser.add_argument("--style", choices=STYLE_NAMES, default="s", help="Map style: " + ", ".join(f"{key}={value}" for key, value in STYLE_NAMES.items()))
+    parser.add_argument("--server", choices=("Google", "Tianditu"), default="Google", help="Map server.")
+    parser.add_argument("--token", default=os.getenv("TIANDITU_TOKEN"), help="Tianditu API token.")
     args = parser.parse_args()
     try:
-        validate_extent(args.left, args.top, args.right, args.bottom, args.zoom)
+        validate_options(args.left, args.top, args.right, args.bottom, args.zoom, args.server, args.token)
     except ValueError as error:
         parser.error(str(error))
     return args
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     args = parse_args()
-    start_time = time.time()
-
-    COUNT = 0  # Progress display, starting at 0
-    mutex = Lock()
-    main(args.left, args.top, args.right, args.bottom, args.zoom, args.output, args.style, args.server)
-
-    end_time = time.time()
-    print('lasted a total of {:.2f} seconds'.format(end_time - start_time))
+    started_at = time.time()
+    main(args.left, args.top, args.right, args.bottom, args.zoom, args.output, args.style, args.server, args.token)
+    print(f"Finished in {time.time() - started_at:.2f} seconds")

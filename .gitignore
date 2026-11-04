@@ -2,3 +2,6 @@
 __pycache__/
 *.py[cod]
 example.tif
+google-comparison.tif
+tianditu-comparison.tif
+map-comparison.png
